@@ -12,7 +12,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	ktypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
-	utilnet "k8s.io/utils/net"
 
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 
@@ -334,19 +333,20 @@ func (oc *DefaultNetworkController) addLogicalPort(pod *corev1.Pod) (err error) 
 		if extIPs, err := getExternalIPsGR(oc.watchFactory, pod.Spec.NodeName); err != nil {
 			return err
 		} else {
-			// Handle each pod IP individually since each IP family needs its own SNAT match
-			for _, podIP := range podAnnotation.IPs {
-				ipFamily := utilnet.IPv4
-				if utilnet.IsIPv6CIDR(podIP) {
-					ipFamily = utilnet.IPv6
-				}
-				snatMatch, err := GetNetworkScopedClusterSubnetSNATMatch(oc.nbClient, oc.GetNetInfo(), pod.Spec.NodeName, oc.isPodNetworkAdvertisedAtNode(pod.Spec.NodeName), ipFamily)
-				if err != nil {
-					return fmt.Errorf("failed to get SNAT match for node %s for network %s: %v", pod.Spec.NodeName, oc.GetNetworkName(), err)
-				}
-				if ops, err = addOrUpdatePodSNATOps(oc.nbClient, oc.GetNetworkScopedGWRouterName(pod.Spec.NodeName), extIPs, []*net.IPNet{podIP}, snatMatch, ops); err != nil {
-					return err
-				}
+			ops, err = AddPodSNATOps(
+				oc.nbClient,
+				oc.addressSetFactory,
+				oc.GetNetInfo(),
+				pod.Spec.NodeName,
+				oc.isPodNetworkAdvertisedAtNode(pod.Spec.NodeName),
+				oc.GetNetworkScopedGWRouterName(pod.Spec.NodeName),
+				extIPs,
+				podAnnotation.IPs,
+				oc.controllerName,
+				ops,
+			)
+			if err != nil {
+				return err
 			}
 		}
 	}
@@ -381,12 +381,12 @@ func (oc *DefaultNetworkController) addLogicalPort(pod *corev1.Pod) (err error) 
 	_ = oc.logicalPortCache.add(pod, switchName, types.DefaultNetworkName, lsp.UUID, podAnnotation.MAC, podAnnotation.IPs)
 
 	if kubevirt.IsPodLiveMigratable(pod) {
-		if err := kubevirt.EnsureDHCPOptionsForMigratablePod(oc.controllerName, oc.nbClient, oc.watchFactory, pod, podAnnotation.IPs, lsp); err != nil {
-			return err
+		if err := oc.ensureDHCP(pod, podAnnotation, lsp); err != nil {
+			return fmt.Errorf("failed configuring DHCP for default network at pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 	}
 
-	//observe the pod creation latency metric for newly created pods only
+	// observe the pod creation latency metric for newly created pods only
 	if newlyCreatedPort {
 		metrics.RecordPodCreated(pod, oc.GetNetInfo())
 	}

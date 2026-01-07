@@ -16,11 +16,15 @@ import (
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/clustermanager/dnsnameresolver"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/clustermanager/egressservice"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/clustermanager/endpointslicemirror"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/clustermanager/managedbgp"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/clustermanager/networkconnect"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/clustermanager/nooverlay"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/clustermanager/routeadvertisements"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/clustermanager/status_manager"
 	udncontroller "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/clustermanager/userdefinednetwork"
 	udntemplate "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/clustermanager/userdefinednetwork/template"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
+	networkconnectclientset "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/crd/clusternetworkconnect/v1/apis/clientset/versioned"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/kube"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/networkmanager"
@@ -48,6 +52,8 @@ type ClusterManager struct {
 	dnsNameResolverController *dnsnameresolver.Controller
 	// Controller for managing user-defined-network CRD
 	userDefinedNetworkController *udncontroller.Controller
+	// Controller for managing cluster-network-connect CRD
+	networkConnectController *networkconnect.Controller
 	// event recorder used to post events to k8s
 	recorder record.EventRecorder
 
@@ -59,7 +65,9 @@ type ClusterManager struct {
 	// networkManager creates and deletes network controllers
 	networkManager networkmanager.Controller
 
-	raController *routeadvertisements.Controller
+	raController         *routeadvertisements.Controller
+	noOverlayController  *nooverlay.Controller
+	managedBGPController *managedbgp.Controller
 }
 
 // NewClusterManager creates a new cluster manager to manage the cluster nodes.
@@ -89,12 +97,13 @@ func NewClusterManager(
 	}
 
 	cm.networkManager = networkmanager.Default()
+	var tunnelKeysAllocator *id.TunnelKeysAllocator
 	if config.OVNKubernetesFeature.EnableMultiNetwork {
 		// tunnelKeysAllocator is now only used for NAD tunnel keys allocation, but will be reused
 		// for Connecting UDNs. So we initialize it here and pass it to the networkManager.
 		// The same instance should be initialized only once and passed to all the
 		// users of tunnel-keys.
-		tunnelKeysAllocator, err := initTunnelKeysAllocator(ovnClient.NetworkAttchDefClient)
+		tunnelKeysAllocator, err = initTunnelKeysAllocator(ovnClient.NetworkAttchDefClient, ovnClient.NetworkConnectClient)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize tunnel keys allocator: %w", err)
 		}
@@ -171,8 +180,16 @@ func NewClusterManager(
 		}
 	}
 
+	if util.IsNetworkConnectEnabled() {
+		cm.networkConnectController = networkconnect.NewController(wf, ovnClient, cm.networkManager.Interface(), tunnelKeysAllocator)
+	}
+
 	if util.IsRouteAdvertisementsEnabled() {
 		cm.raController = routeadvertisements.NewController(cm.networkManager.Interface(), wf, ovnClient)
+		if config.Default.Transport == config.TransportNoOverlay {
+			cm.noOverlayController = nooverlay.NewController(wf, ovnClient.RouteAdvertisementsClient, recorder)
+		}
+		cm.managedBGPController = managedbgp.NewController(wf, ovnClient.FRRClient, recorder)
 	}
 
 	return cm, nil
@@ -233,8 +250,25 @@ func (cm *ClusterManager) Start(ctx context.Context) error {
 		}
 	}
 
+	if cm.networkConnectController != nil {
+		if err := cm.networkConnectController.Start(); err != nil {
+			return err
+		}
+	}
+
 	if cm.raController != nil {
+		if err := cm.managedBGPController.Start(); err != nil {
+			return err
+		}
 		err := cm.raController.Start()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Start no-overlay validation controller
+	if cm.noOverlayController != nil {
+		err := cm.noOverlayController.Start()
 		if err != nil {
 			return err
 		}
@@ -265,9 +299,17 @@ func (cm *ClusterManager) Stop() {
 	if util.IsNetworkSegmentationSupportEnabled() {
 		cm.userDefinedNetworkController.Shutdown()
 	}
+	if cm.networkConnectController != nil {
+		cm.networkConnectController.Stop()
+	}
 	if cm.raController != nil {
+		cm.managedBGPController.Stop()
 		cm.raController.Stop()
 		cm.raController = nil
+	}
+	if cm.noOverlayController != nil {
+		cm.noOverlayController.Stop()
+		cm.noOverlayController = nil
 	}
 }
 
@@ -294,7 +336,7 @@ func (cm *ClusterManager) Reconcile(name string, old, new util.NetInfo) error {
 // It will be shared across multiple controllers and should account for different object types.
 // Good news is that we don't care about missing events, because we only need to reserve ids that are already
 // annotated, and no one else can annotate them except ClusterManager.
-func initTunnelKeysAllocator(nadClient networkattchmentdefclientset.Interface) (*id.TunnelKeysAllocator, error) {
+func initTunnelKeysAllocator(nadClient networkattchmentdefclientset.Interface, cncClient networkconnectclientset.Interface) (*id.TunnelKeysAllocator, error) {
 	tunnelKeysAllocator := id.NewTunnelKeyAllocator("TunnelKeys")
 
 	existingNADs, err := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions("").List(context.TODO(), metav1.ListOptions{})
@@ -320,6 +362,23 @@ func initTunnelKeysAllocator(nadClient networkattchmentdefclientset.Interface) (
 			}
 			if err = tunnelKeysAllocator.ReserveKeys(networkName, tunnelKeys); err != nil {
 				return nil, fmt.Errorf("failed to reserve tunnel keys %v for network %s: %w", tunnelKeys, networkName, err)
+			}
+		}
+	}
+	if util.IsNetworkConnectEnabled() {
+		existingCNCs, err := cncClient.K8sV1().ClusterNetworkConnects().List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list existing CNCs: %w", err)
+		}
+		for _, cnc := range existingCNCs.Items {
+			tunnelID, err := util.ParseNetworkConnectTunnelKeyAnnotation(&cnc)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse annotated tunnel ID: %w", err)
+			}
+			if tunnelID != 0 {
+				if err = tunnelKeysAllocator.ReserveKeys(cnc.Name, []int{tunnelID}); err != nil {
+					return nil, fmt.Errorf("failed to reserve tunnel ID %d for CNC %s: %w", tunnelID, cnc.Name, err)
+				}
 			}
 		}
 	}

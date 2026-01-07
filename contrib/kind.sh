@@ -16,7 +16,7 @@ delete() {
   if [ "$KIND_INSTALL_METALLB" == true ]; then
     destroy_metallb
   fi
-  if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
+  if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ] && [ "$NO_OVERLAY_MANAGED_ROUTING" != "true" ]; then
     destroy_bgp
   fi
   timeout 5 kubectl --kubeconfig "${KUBECONFIG}" delete namespace ovn-kubernetes || true
@@ -51,12 +51,15 @@ usage() {
     echo "                 [-is | --ipsec]"
     echo "                 [-cm | --compact-mode]"
     echo "                 [-ic | --enable-interconnect]"
+    echo "                 [-nce | --network-connect-enable]"
     echo "                 [-uae | --preconfigured-udn-addresses-enable]"
     echo "                 [-rae | --enable-route-advertisements]"
     echo "                 [-rud | --routed-udn-isolation-disable]"
     echo "                 [-adv | --advertise-default-network]"
     echo "                 [-nqe | --network-qos-enable]"
+    echo "                 [-noe | --enable-no-overlay [snat-enabled]]"
     echo "                 [--isolated]"
+    echo "                 [--enable-coredumps]"
     echo "                 [-dns | --enable-dnsnameresolver]"
     echo "                 [-obs | --observability]"
     echo "                 [-h]]"
@@ -114,12 +117,13 @@ echo "-ehp | --egress-ip-healthcheck-port           TCP port used for gRPC sessi
 echo "-is  | --ipsec                                Enable IPsec encryption (spawns ovn-ipsec pods)"
 echo "-sm  | --scale-metrics                        Enable scale metrics"
 echo "-cm  | --compact-mode                         Enable compact mode, ovnkube master and node run in the same process."
-echo "-ce  | --enable-central                       Deploy with OVN Central (Legacy Architecture)"
+echo "-ce  | --enable-central                       [DEPRECATED] Deploy with OVN Central (Legacy Architecture)"
 echo "-nqe | --network-qos-enable                   Enable network QoS. DEFAULT: Disabled."
 echo "--disable-ovnkube-identity                    Disable per-node cert and ovnkube-identity webhook"
 echo "-npz | --nodes-per-zone                       If interconnect is enabled, number of nodes per zone (Default 1). If this value > 1, then (total k8s nodes (workers + 1) / num of nodes per zone) should be zero."
 echo "-mtu                                          Define the overlay mtu"
 echo "--isolated                                    Deploy with an isolated environment (no default gateway)"
+echo "--enable-coredumps                            Enable coredump collection on kind nodes. DEFAULT: Disabled."
 echo "--delete                                      Delete current cluster"
 echo "--deploy                                      Deploy ovn-kubernetes without restarting kind"
 echo "--add-nodes                                   Adds nodes to an existing cluster. The number of nodes to be added is specified by --num-workers. Also use -ic if the cluster is using interconnect."
@@ -130,6 +134,7 @@ echo "-rae | --enable-route-advertisements          Enable route advertisements"
 echo "-adv | --advertise-default-network            Applies a RouteAdvertisements configuration to advertise the default network on all nodes"
 echo "-rud | --routed-udn-isolation-disable         Disable isolation across BGP-advertised UDNs (sets advertised-udn-isolation-mode=loose). DEFAULT: strict."
 echo "-mps | --multi-pod-subnet                     Use multiple subnets for the default cluster network"
+echo "-noe | --enable-no-overlay [snat-enabled|managed] Enable no overlay for the default network. Optional value: 'snat-enabled' to enable SNAT, 'managed' to enable SNAT and managed routing. DEFAULT: disabled."
 echo ""
 }
 
@@ -309,9 +314,13 @@ parse_args() {
                                                 ;;
             --isolated )                        OVN_ISOLATED=true
                                                 ;;
+            --enable-coredumps )                ENABLE_COREDUMPS=true
+                                                ;;
             -mne | --multi-network-enable )     ENABLE_MULTI_NET=true
                                                 ;;
             -nse | --network-segmentation-enable) ENABLE_NETWORK_SEGMENTATION=true
+                                                  ;;
+            -nce | --network-connect-enable )    ENABLE_NETWORK_CONNECT=true
                                                   ;;
             -uae | --preconfigured-udn-addresses-enable) ENABLE_PRE_CONF_UDN_ADDR=true
                                                   ;;
@@ -321,11 +330,31 @@ parse_args() {
                                                   ;;
             -rud | --routed-udn-isolation-disable) ADVERTISED_UDN_ISOLATION_MODE=loose
                                                   ;;
-            -ce | --enable-central )              OVN_ENABLE_INTERCONNECT=false
+            -ce | --enable-central )              echo "WARNING: --enable-central is deprecated. OVN Central (Legacy Architecture) will be removed in a future release." >&2
+                                                  OVN_ENABLE_INTERCONNECT=false
                                                   CENTRAL_ARG_PROVIDED=true
                                                   ;;
             -ic | --enable-interconnect )         OVN_ENABLE_INTERCONNECT=true
                                                   IC_ARG_PROVIDED=true
+                                                  ;;
+            -noe | --enable-no-overlay)         ENABLE_NO_OVERLAY=true
+                                                  # Check if next argument is a valid value
+                                                  if [[ -n "$2" && ! "$2" =~ ^- ]]; then
+                                                    if [[ "$2" == "snat-enabled" ]]; then
+                                                      ENABLE_NO_OVERLAY_OUTBOUND_SNAT=true
+                                                      shift  # consume the value argument
+                                                    elif [[ "$2" == "managed" ]]; then
+                                                      ENABLE_NO_OVERLAY_OUTBOUND_SNAT=true
+                                                      NO_OVERLAY_MANAGED_ROUTING=true
+                                                      shift  # consume the value argument
+                                                    else
+                                                      echo "Error: Invalid value for --enable-no-overlay: $2"
+                                                      echo "Valid values are: snat-enabled, managed"
+                                                      exit 1
+                                                    fi
+                                                  else
+                                                    ENABLE_NO_OVERLAY_OUTBOUND_SNAT=false
+                                                  fi
                                                   ;;
             --disable-ovnkube-identity)         OVN_ENABLE_OVNKUBE_IDENTITY=false
                                                 ;;
@@ -423,10 +452,14 @@ print_params() {
      echo "OVN_ISOLATED = $OVN_ISOLATED"
      echo "ENABLE_MULTI_NET = $ENABLE_MULTI_NET"
      echo "ENABLE_NETWORK_SEGMENTATION= $ENABLE_NETWORK_SEGMENTATION"
+     echo "ENABLE_NETWORK_CONNECT = $ENABLE_NETWORK_CONNECT"
      echo "ENABLE_ROUTE_ADVERTISEMENTS= $ENABLE_ROUTE_ADVERTISEMENTS"
      echo "ADVERTISED_UDN_ISOLATION_MODE= $ADVERTISED_UDN_ISOLATION_MODE"
      echo "ADVERTISE_DEFAULT_NETWORK = $ADVERTISE_DEFAULT_NETWORK"
      echo "ENABLE_PRE_CONF_UDN_ADDR = $ENABLE_PRE_CONF_UDN_ADDR"
+     echo "ENABLE_NO_OVERLAY = $ENABLE_NO_OVERLAY"
+     echo "ENABLE_NO_OVERLAY_OUTBOUND_SNAT = $ENABLE_NO_OVERLAY_OUTBOUND_SNAT"
+     echo "NO_OVERLAY_MANAGED_ROUTING = $NO_OVERLAY_MANAGED_ROUTING"
      echo "OVN_ENABLE_INTERCONNECT = $OVN_ENABLE_INTERCONNECT"
      if [ "$OVN_ENABLE_INTERCONNECT" == true ]; then
        echo "KIND_NUM_NODES_PER_ZONE = $KIND_NUM_NODES_PER_ZONE"
@@ -594,6 +627,7 @@ set_default_params() {
   if [ "$MULTI_POD_SUBNET" == true ]; then
     NET_CIDR_IPV4="10.243.0.0/23/24,10.244.0.0/16"
     NET_CIDR_IPV6="fd00:10:243::/63/64,fd00:10:244::/48"
+    
   fi
   NET_SECOND_CIDR_IPV4=${NET_SECOND_CIDR_IPV4:-172.19.0.0/16}
   SVC_CIDR_IPV4=${SVC_CIDR_IPV4:-10.96.0.0/16}
@@ -677,8 +711,31 @@ set_default_params() {
     echo "Preconfigured UDN addresses requires interconnect to be enabled (-ic)"
     exit 1
   fi
+  ENABLE_NETWORK_CONNECT=${ENABLE_NETWORK_CONNECT:-false}
+  if [[ $ENABLE_NETWORK_CONNECT == true && $ENABLE_NETWORK_SEGMENTATION != true ]]; then
+    echo "Network connect requires network-segmentation to be enabled (-nse)"
+    exit 1
+  fi
   ADVERTISED_UDN_ISOLATION_MODE=${ADVERTISED_UDN_ISOLATION_MODE:-strict}
   ADVERTISE_DEFAULT_NETWORK=${ADVERTISE_DEFAULT_NETWORK:-false}
+  ENABLE_NO_OVERLAY=${ENABLE_NO_OVERLAY:-false}
+  ENABLE_NO_OVERLAY_OUTBOUND_SNAT=${ENABLE_NO_OVERLAY_OUTBOUND_SNAT:-false}
+  NO_OVERLAY_MANAGED_ROUTING=${NO_OVERLAY_MANAGED_ROUTING:-false}
+  if [ "$ENABLE_NO_OVERLAY" == true ] && [ "$ENABLE_MULTI_NET" != true ]; then
+    echo "No-overlay mode requires multi-network to be enabled (-mne)"
+    exit 1
+  fi
+  if [ "$ENABLE_NO_OVERLAY" == true ] && [ "$ENABLE_ROUTE_ADVERTISEMENTS" != true ]; then
+    echo "No-overlay mode requires route advertisement to be enabled (-rae)"
+    exit 1
+  fi
+  if [ "$ENABLE_NO_OVERLAY" == true ] && [ "$NO_OVERLAY_MANAGED_ROUTING" != true ] && [ "$ADVERTISE_DEFAULT_NETWORK" != true ]; then
+    echo "No-overlay mode requires advertise the default network (-adv)"
+    exit 1
+  fi
+  if [ "$ENABLE_NO_OVERLAY" == true ] && [ -z "$OVN_MTU" ]; then
+    OVN_MTU=1500
+  fi
   OVN_COMPACT_MODE=${OVN_COMPACT_MODE:-false}
   if [ "$OVN_COMPACT_MODE" == true ]; then
     KIND_NUM_WORKER=0
@@ -686,6 +743,7 @@ set_default_params() {
   OVN_MTU=${OVN_MTU:-1400}
   OVN_ENABLE_DNSNAMERESOLVER=${OVN_ENABLE_DNSNAMERESOLVER:-false}
   OVN_OBSERV_ENABLE=${OVN_OBSERV_ENABLE:-false}
+  ENABLE_COREDUMPS=${ENABLE_COREDUMPS:-false}
 }
 
 check_ipv6() {
@@ -888,6 +946,7 @@ create_ovn_kube_manifests() {
         ovnkube_image=$($OCI_BIN inspect --format='{{index .RepoDigests 0}}' $OVN_IMAGE)
       fi
     fi
+
     pushd ${DIR}/../dist/images
     if [ "$OVN_ENABLE_INTERCONNECT" == true ]; then
       KIND_NUM_NODES_PER_ZONE=${KIND_NUM_NODES_PER_ZONE:-1}
@@ -920,6 +979,7 @@ create_ovn_kube_manifests() {
     --ovn-loglevel-sb="${OVN_LOG_LEVEL_SB}" \
     --ovn-loglevel-controller="${OVN_LOG_LEVEL_CONTROLLER}" \
     --ovnkube-libovsdb-client-logfile="${LIBOVSDB_CLIENT_LOGFILE}" \
+    --enable-coredumps="${ENABLE_COREDUMPS}" \
     --ovnkube-config-duration-enable=true \
     --admin-network-policy-enable=true \
     --egress-ip-enable=true \
@@ -936,10 +996,14 @@ create_ovn_kube_manifests() {
     --ex-gw-network-interface="${OVN_EX_GW_NETWORK_INTERFACE}" \
     --multi-network-enable="${ENABLE_MULTI_NET}" \
     --network-segmentation-enable="${ENABLE_NETWORK_SEGMENTATION}" \
+    --network-connect-enable="${ENABLE_NETWORK_CONNECT}" \
     --preconfigured-udn-addresses-enable="${ENABLE_PRE_CONF_UDN_ADDR}" \
     --route-advertisements-enable="${ENABLE_ROUTE_ADVERTISEMENTS}" \
     --advertise-default-network="${ADVERTISE_DEFAULT_NETWORK}" \
     --advertised-udn-isolation-mode="${ADVERTISED_UDN_ISOLATION_MODE}" \
+    --no-overlay-enable="${ENABLE_NO_OVERLAY}" \
+    --no-overlay-enable-snat="${ENABLE_NO_OVERLAY_OUTBOUND_SNAT}" \
+    --no-overlay-managed-routing="${NO_OVERLAY_MANAGED_ROUTING}" \
     --ovnkube-metrics-scale-enable="${OVN_METRICS_SCALE_ENABLE}" \
     --compact-mode="${OVN_COMPACT_MODE}" \
     --enable-interconnect="${OVN_ENABLE_INTERCONNECT}" \
@@ -1035,7 +1099,9 @@ install_ovn() {
   run_kubectl apply -f k8s.ovn.org_userdefinednetworks.yaml
   run_kubectl apply -f k8s.ovn.org_clusteruserdefinednetworks.yaml
   run_kubectl apply -f k8s.ovn.org_routeadvertisements.yaml
-  run_kubectl apply -f k8s.ovn.org_clusternetworkconnects.yaml
+  if [ "$ENABLE_NETWORK_CONNECT" == true ]; then
+    run_kubectl apply -f k8s.ovn.org_clusternetworkconnects.yaml
+  fi
   # NOTE: When you update vendoring versions for the ANP & BANP APIs, we must update the version of the CRD we pull from in the below URL
   run_kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/network-policy-api/v0.1.5/config/crd/experimental/policy.networking.k8s.io_adminnetworkpolicies.yaml
   run_kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/network-policy-api/v0.1.5/config/crd/experimental/policy.networking.k8s.io_baselineadminnetworkpolicies.yaml
@@ -1214,6 +1280,9 @@ check_ipv6
 set_cluster_cidr_ip_families
 if [ "$KIND_CREATE" == true ]; then
     create_kind_cluster
+    if [ "$ENABLE_COREDUMPS" == true ]; then
+      setup_coredumps
+    fi
     if [ "$RUN_IN_CONTAINER" == true ]; then
       run_script_in_container
     fi
@@ -1243,8 +1312,16 @@ if [ "$OVN_ENABLE_DNSNAMERESOLVER" == true ]; then
     update_coredns_deployment_image
 fi
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
-  deploy_frr_external_container
-  deploy_bgp_external_server
+  frr_port=0
+  if [ "$NO_OVERLAY_MANAGED_ROUTING" == true ]; then
+    # Enable bgp port listening on node, required for managed mode. FRR will listen on port 179 to receive BGP updates from other nodes.
+    frr_port=179
+  else
+    # external FRR is required for unmanaged mode
+    deploy_frr_external_container
+    deploy_bgp_external_server
+  fi
+  install_frr_k8s $frr_port
 fi
 build_ovn_image
 detect_apiserver_url
@@ -1282,8 +1359,13 @@ if [ "$KIND_INSTALL_KUBEVIRT" == true ]; then
     install_kubevirt_ipam_controller
   fi
 fi
+
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
-  install_ffr_k8s
+  # wait for frr-k8s to be ready
+  wait_for_frr_k8s
+  if [ "$NO_OVERLAY_MANAGED_ROUTING" != true ]; then
+    configure_frr_k8s
+  fi
 fi
 
 interconnect_arg_check

@@ -58,6 +58,9 @@ type NetInfo interface {
 	PhysicalNetworkName() string
 	GetNodeGatewayIP(hostSubnet *net.IPNet) *net.IPNet
 	GetNodeManagementIP(hostSubnet *net.IPNet) *net.IPNet
+	// GetNetworkTransport returns the transport technology used by this network.
+	GetNetworkTransport() string
+	GetOutboundSNAT() string
 
 	// dynamic information, can change over time
 	GetNADs() []string
@@ -395,6 +398,14 @@ func (nInfo *mutableNetInfo) GetEgressIPAdvertisedNodes() []string {
 	return maps.Keys(nInfo.eipAdvertisements)
 }
 
+func (nInfo *mutableNetInfo) GetNetworkTransport() string {
+	return ""
+}
+
+func (nInfo *mutableNetInfo) GetOutboundSNAT() string {
+	return ""
+}
+
 // GetNADs returns all the NADs associated with this network
 func (nInfo *mutableNetInfo) GetNADs() []string {
 	nInfo.RLock()
@@ -681,6 +692,14 @@ func (nInfo *DefaultNetInfo) GetNodeManagementIP(hostSubnet *net.IPNet) *net.IPN
 	return GetNodeManagementIfAddr(hostSubnet)
 }
 
+func (nInfo *DefaultNetInfo) GetNetworkTransport() string {
+	return config.Default.Transport
+}
+
+func (nInfo *DefaultNetInfo) GetOutboundSNAT() string {
+	return config.NoOverlay.OutboundSNAT
+}
+
 // userDefinedNetInfo holds the network name information for a User Defined Network if non-nil
 type userDefinedNetInfo struct {
 	mutableNetInfo
@@ -693,6 +712,7 @@ type userDefinedNetInfo struct {
 	mtu                int
 	vlan               uint
 	allowPersistentIPs bool
+	transport          string
 
 	ipv4mode, ipv6mode    bool
 	subnets               []config.CIDRNetworkEntry
@@ -903,6 +923,14 @@ func (nInfo *userDefinedNetInfo) TransitSubnets() []*net.IPNet {
 	return nInfo.transitSubnets
 }
 
+func (nInfo *userDefinedNetInfo) GetNetworkTransport() string {
+	return nInfo.transport
+}
+
+func (nInfo *userDefinedNetInfo) GetOutboundSNAT() string {
+	return ""
+}
+
 func (nInfo *userDefinedNetInfo) canReconcile(other NetInfo) bool {
 	if (nInfo == nil) != (other == nil) {
 		return false
@@ -937,6 +965,9 @@ func (nInfo *userDefinedNetInfo) canReconcile(other NetInfo) bool {
 		return false
 	}
 
+	if nInfo.transport != other.GetNetworkTransport() {
+		return false
+	}
 	lessCIDRNetworkEntry := func(a, b config.CIDRNetworkEntry) bool { return a.String() < b.String() }
 	if !cmp.Equal(nInfo.subnets, other.Subnets(), cmpopts.SortSlices(lessCIDRNetworkEntry)) {
 		return false
@@ -978,6 +1009,7 @@ func (nInfo *userDefinedNetInfo) copy() *userDefinedNetInfo {
 		physicalNetworkName:   nInfo.physicalNetworkName,
 		defaultGatewayIPs:     nInfo.defaultGatewayIPs,
 		managementIPs:         nInfo.managementIPs,
+		transport:             nInfo.transport,
 	}
 	// copy mutables
 	c.mutableNetInfo.copyFrom(&nInfo.mutableNetInfo)
@@ -1001,6 +1033,7 @@ func newLayer3NetConfInfo(netconf *ovncnitypes.NetConf) (MutableNetInfo, error) 
 		subnets:        subnets,
 		joinSubnets:    joinSubnets,
 		mtu:            netconf.MTU,
+		transport:      netconf.Transport,
 		mutableNetInfo: mutableNetInfo{
 			id:   types.InvalidID,
 			nads: sets.Set[string]{},
@@ -1076,6 +1109,7 @@ func newLayer2NetConfInfo(netconf *ovncnitypes.NetConf) (MutableNetInfo, error) 
 		allowPersistentIPs:    netconf.AllowPersistentIPs,
 		defaultGatewayIPs:     defaultGatewayIPs,
 		managementIPs:         managementIPs,
+		transport:             netconf.Transport,
 		mutableNetInfo: mutableNetInfo{
 			id:   types.InvalidID,
 			nads: sets.Set[string]{},
@@ -1109,6 +1143,7 @@ func newLocalnetNetConfInfo(netconf *ovncnitypes.NetConf) (MutableNetInfo, error
 		vlan:                uint(netconf.VLANID),
 		allowPersistentIPs:  netconf.AllowPersistentIPs,
 		physicalNetworkName: netconf.PhysicalNetworkName,
+		transport:           netconf.Transport,
 		mutableNetInfo: mutableNetInfo{
 			id:   types.InvalidID,
 			nads: sets.Set[string]{},
@@ -1543,7 +1578,6 @@ func overrideActiveNSEWithDefaultNSE(defaultNSE, activeNSE *nettypes.NetworkSele
 	}
 	activeNSE.IPRequest = defaultNSE.IPRequest
 	activeNSE.MacRequest = defaultNSE.MacRequest
-	activeNSE.IPAMClaimReference = defaultNSE.IPAMClaimReference
 	return nil
 }
 
@@ -1586,29 +1620,38 @@ func GetPodNADToNetworkMappingWithActiveNetwork(pod *corev1.Pod, nInfo NetInfo, 
 		Name:      activeNADKey.Name,
 	}
 
+	isPersistentIPsPrimaryNetwork := nInfo.IsPrimaryNetwork() && AllowsPersistentIPs(nInfo)
+	var defaultNSE *nettypes.NetworkSelectionElement
+	if isPersistentIPsPrimaryNetwork || IsPreconfiguredUDNAddressesEnabled() {
+		defaultNSE, err = GetK8sPodDefaultNetworkSelection(pod)
+		if err != nil {
+			return false, nil, fmt.Errorf("failed getting default-network annotation for pod %q: %w", pod.Namespace+"/"+pod.Name, err)
+		}
+	}
+
+	if isPersistentIPsPrimaryNetwork {
+		// 'k8s.ovn.org/primary-udn-ipamclaim' annotation has been deprecated. Maintain backward compatibility by
+		// using it as a fallback; when defaultNSE.IPAMClaimReference is set, it takes precedence.
+		if ipamClaimName, wasPersistentIPRequested := pod.Annotations[DeprecatedOvnUDNIPAMClaimName]; wasPersistentIPRequested {
+			activeNSE.IPAMClaimReference = ipamClaimName
+		}
+		if defaultNSE != nil && defaultNSE.IPAMClaimReference != "" {
+			activeNSE.IPAMClaimReference = defaultNSE.IPAMClaimReference
+		}
+	}
+
 	// Feature gate integration: EnablePreconfiguredUDNAddresses controls default network IP/MAC transfer to active network
 	if IsPreconfiguredUDNAddressesEnabled() {
 		// Limit the static ip and mac requests to the layer2 primary UDN when EnablePreconfiguredUDNAddresses is enabled, we
 		// don't need to explicitly check this is primary UDN since
 		// the "active network" concept is exactly that.
 		if activeNetwork.TopologyType() == types.Layer2Topology {
-			defaultNSE, err := GetK8sPodDefaultNetworkSelection(pod)
-			if err != nil {
-				return false, nil, fmt.Errorf("failed getting default-network annotation for pod %q: %w", pod.Namespace+"/"+pod.Name, err)
-			}
 			// If there are static IPs and MACs at the default NSE, override the active NSE with them
 			if defaultNSE != nil {
 				if err := overrideActiveNSEWithDefaultNSE(defaultNSE, activeNSE); err != nil {
 					return false, nil, err
 				}
 			}
-		}
-	}
-
-	if nInfo.IsPrimaryNetwork() && AllowsPersistentIPs(nInfo) && activeNSE.IPAMClaimReference == "" {
-		ipamClaimName, wasPersistentIPRequested := pod.Annotations[OvnUDNIPAMClaimName]
-		if wasPersistentIPRequested {
-			activeNSE.IPAMClaimReference = ipamClaimName
 		}
 	}
 
@@ -1638,6 +1681,10 @@ func IsMultiNetworkPoliciesSupportEnabled() bool {
 
 func IsNetworkSegmentationSupportEnabled() bool {
 	return config.OVNKubernetesFeature.EnableMultiNetwork && config.OVNKubernetesFeature.EnableNetworkSegmentation
+}
+
+func IsNetworkConnectEnabled() bool {
+	return IsNetworkSegmentationSupportEnabled() && config.OVNKubernetesFeature.EnableNetworkConnect
 }
 
 func IsRouteAdvertisementsEnabled() bool {
